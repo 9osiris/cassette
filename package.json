@@ -1,0 +1,16 @@
+{
+  "bin": {
+    "cassette": "./bin/cassette.js"
+  },
+  "description": "record and replay openai-compatible api traffic for deterministic agent tests",
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "name": "cassette",
+  "scripts": {
+    "test": "node --test test/cassette.test.js"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
