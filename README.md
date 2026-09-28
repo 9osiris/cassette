@@ -43,6 +43,8 @@ useful flags:
 - `--passthrough --upstream URL` - unmatched requests hit the real api and
   get appended to the tape. good for growing a tape over time.
 - `--chunk-delay MS` - replay streamed chunks with realistic timing.
+- `--seed N` - with --chunk-delay, jitter each chunk's delay between 0.5x
+  and 1.5x of the base, deterministically. same seed, same timing, every run.
 - `-v` - log hits and misses.
 
 ## tapes
