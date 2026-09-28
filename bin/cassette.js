@@ -15,7 +15,7 @@ const HELP = `cassette ${pkg.version} - record and replay openai-compatible api 
 usage:
   cassette record --tape NAME --upstream URL [--port 11434] [--tape-dir ./tapes]
   cassette replay --tape NAME [--port 11434] [--tape-dir ./tapes]
-                         [--passthrough --upstream URL] [--chunk-delay MS] [-v]
+                         [--passthrough --upstream URL] [--chunk-delay MS] [--seed N] [-v]
   cassette list [--tape-dir ./tapes]
   cassette show NAME [--tape-dir ./tapes]
   cassette rm NAME [--tape-dir ./tapes]
@@ -113,6 +113,7 @@ async function main() {
       passthrough: !!flags.passthrough,
       upstream: flags.upstream,
       chunkDelay: Number(flags["chunk-delay"] || 0),
+      seed: flags.seed != null ? Number(flags.seed) : null,
       verbose: !!(flags.v || flags.verbose),
     });
     console.log(`replaying ${tapeDir}/${tape}.json on 127.0.0.1:${port}`);
