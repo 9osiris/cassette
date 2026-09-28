@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { redactBody, redactHeaders, redactQuery } from "../lib/redact.js";
 import { parseSse, serializeSse } from "../lib/sse.js";
+import { nextChunkDelay, seededRng } from "../lib/rng.js";
 import {
   canonical,
   deleteTape,
@@ -342,5 +343,124 @@ test("cli list show rm", async () => {
   assert.match(run(["show", "demo", "--tape-dir", t]), /exchanges: 0/);
   assert.match(run(["rm", "demo", "--tape-dir", t]), /deleted demo/);
   assert.deepEqual(listTapes(t), []);
+  rmSync(t, { recursive: true, force: true });
+});
+
+test("seeded rng is deterministic per seed", () => {
+  const a = seededRng(7);
+  const b = seededRng(7);
+  const seqA = [a(), a(), a(), a(), a()];
+  const seqB = [b(), b(), b(), b(), b()];
+  assert.deepEqual(seqA, seqB);
+  assert.notEqual(seededRng(8)(), seqA[0]);
+  for (const v of seqA) {
+    assert.ok(v >= 0 && v < 1);
+  }
+});
+
+test("nextChunkDelay jitters 0.5x to 1.5x, flat without rng", () => {
+  const rng = seededRng(42);
+  for (let i = 0; i < 50; i++) {
+    const d = nextChunkDelay(rng, 20);
+    assert.ok(d >= 10 && d <= 30, "delay " + d + " out of range");
+  }
+  assert.equal(nextChunkDelay(null, 20), 20);
+});
+
+// tape with a 4-chunk stream, built by hand so no upstream needed
+function timedTape(t) {
+  const body = JSON.stringify({ model: "x", stream: true });
+  const tape = newTape("timed", null);
+  tape.exchanges.push({
+    request: {
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: {},
+      body,
+      fingerprint: fingerprintRequest("POST", "/v1/chat/completions", body),
+    },
+    response: {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      streamed: true,
+      body: ["data: a", "data: b", "data: c", "data: [DONE]"],
+    },
+    duration_ms: 1,
+    recorded_at: new Date().toISOString(),
+  });
+  saveTape(t, tape);
+}
+
+// arrival timestamps of each sse chunk on the client side
+function streamTimes(port, body) {
+  return new Promise((resolve, reject) => {
+    const times = [];
+    const req = request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: { connection: "close", "content-type": "application/json" },
+      },
+      (res) => {
+        res.on("data", () => times.push(Date.now()));
+        res.on("end", () => resolve(times));
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+const chunkDeltas = async (port, body) => {
+  const t = await streamTimes(port, body);
+  return t.slice(1).map((x, i) => x - t[i]);
+};
+
+test("replay --seed jitters chunk timing within bounds, content intact", async () => {
+  const t = dir();
+  timedTape(t);
+  const body = JSON.stringify({ model: "x", stream: true });
+
+  const replay = await startReplay({
+    tape: "timed",
+    port: 0,
+    tapeDir: t,
+    chunkDelay: 30,
+    seed: 7,
+  });
+  const port = replay.address().port;
+  const text = (await call(port, "/v1/chat/completions", { body })).text;
+  assert.equal(parseSse(text).join("|"), "data: a|data: b|data: c|data: [DONE]");
+
+  const deltas = await chunkDeltas(port, body);
+  assert.equal(deltas.length, 3);
+  for (const d of deltas) {
+    assert.ok(d >= 12 && d <= 48, "chunk gap " + d + "ms outside jitter band");
+  }
+  // jitter is real, not a flat delay
+  assert.ok(new Set(deltas).size > 1, "expected varied gaps, got " + deltas);
+  await shut(replay);
+  rmSync(t, { recursive: true, force: true });
+});
+
+test("replay without --seed keeps a flat chunk delay", async () => {
+  const t = dir();
+  timedTape(t);
+  const body = JSON.stringify({ model: "x", stream: true });
+
+  const replay = await startReplay({
+    tape: "timed",
+    port: 0,
+    tapeDir: t,
+    chunkDelay: 30,
+  });
+  const deltas = await chunkDeltas(replay.address().port, body);
+  for (const d of deltas) {
+    assert.ok(Math.abs(d - 30) <= 8, "flat gap drifted: " + d + "ms");
+  }
+  await shut(replay);
   rmSync(t, { recursive: true, force: true });
 });
