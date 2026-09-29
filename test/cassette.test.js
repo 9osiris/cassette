@@ -464,3 +464,170 @@ test("replay without --seed keeps a flat chunk delay", async () => {
   await shut(replay);
   rmSync(t, { recursive: true, force: true });
 });
+
+import {
+  bodyEqual,
+  comparePair,
+  diffTapes,
+  formatDiff,
+  lineDiff,
+  responseLines,
+} from "../lib/diff.js";
+
+// build a tape from [method, path, requestBody, responseBody] specs
+function diffTape(name, specs) {
+  const tape = newTape(name, null);
+  for (const [method, path, reqBody, respBody] of specs) {
+    const bodyText =
+      typeof reqBody === "string" ? reqBody : JSON.stringify(reqBody);
+    let stored = reqBody;
+    try {
+      stored = JSON.parse(bodyText);
+    } catch {
+      // plain text, keep as-is
+    }
+    tape.exchanges.push({
+      request: {
+        method,
+        path,
+        headers: {},
+        body: stored,
+        fingerprint: fingerprintRequest(method, path, bodyText),
+      },
+      response: {
+        status: 200,
+        headers: {},
+        streamed: Array.isArray(respBody),
+        body: respBody,
+      },
+      duration_ms: 1,
+      recorded_at: new Date().toISOString(),
+    });
+  }
+  return tape;
+}
+
+test("lineDiff marks changed lines", () => {
+  const ops = lineDiff(["a", "b", "c"], ["a", "x", "c"]);
+  assert.deepEqual(
+    ops.map((o) => o.t),
+    [" ", "-", "+", " "]
+  );
+  assert.equal(
+    ops.find((o) => o.t === "-").s,
+    "b"
+  );
+  assert.equal(
+    ops.find((o) => o.t === "+").s,
+    "x"
+  );
+});
+
+test("responseLines pretty-prints json with sorted keys", () => {
+  assert.deepEqual(responseLines({ b: 1, a: 2 }), [
+    "{",
+    '  "a": 2,',
+    '  "b": 1',
+    "}",
+  ]);
+});
+
+test("bodyEqual ignores key order", () => {
+  assert.ok(bodyEqual({ a: 1, b: 2 }, { b: 2, a: 1 }));
+  assert.ok(!bodyEqual({ a: 1 }, { a: 2 }));
+});
+
+test("diffTapes calls identical tapes all same", () => {
+  const specs = [
+    ["POST", "/v1/chat/completions", { model: "x" }, { ok: true, n: 1 }],
+  ];
+  const rows = diffTapes(diffTape("a", specs), diffTape("b", specs));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].status, "same");
+});
+
+test("diffTapes reports a changed response body with a unified diff", () => {
+  const req = ["POST", "/v1/chat/completions", { model: "x" }];
+  const a = diffTape("a", [[...req, { content: "hello back" }]]);
+  const b = diffTape("b", [[...req, { content: "hello there" }]]);
+  const rows = diffTapes(a, b);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].status, "response");
+  assert.equal(rows[0].note, "body differs");
+  const lines = rows[0].diff.join("\n");
+  assert.match(lines, /-.*"content": "hello back"/);
+  assert.match(lines, /\+.*"content": "hello there"/);
+});
+
+test("diffTapes flags status changes", () => {
+  const req = ["POST", "/v1/chat/completions", { model: "x" }];
+  const a = diffTape("a", [[...req, { ok: true }]]);
+  const b = diffTape("b", [[...req, { ok: true }]]);
+  b.exchanges[0].response.status = 429;
+  const rows = diffTapes(a, b);
+  assert.equal(rows[0].status, "response");
+  assert.match(rows[0].note, /status 200 -> 429/);
+});
+
+test("diffTapes pairs by fingerprint across added and removed calls", () => {
+  const mk = (body) => ["POST", "/v1/chat/completions", body, { ok: true }];
+  const a = diffTape("a", [mk({ model: "x", q: 1 }), mk({ model: "x", q: 2 })]);
+  const b = diffTape("b", [mk({ model: "x", q: 1 }), mk({ model: "x", q: 3 })]);
+  const rows = diffTapes(a, b);
+  assert.deepEqual(
+    rows.map((r) => r.status),
+    ["same", "only-in-old", "only-in-new"]
+  );
+});
+
+test("diffTapes diffs streamed chunk bodies", () => {
+  const req = ["POST", "/v1/chat/completions", { model: "x", stream: true }];
+  const a = diffTape("a", [[...req, ["data: a", "data: [DONE]"]]]);
+  const b = diffTape("b", [[...req, ["data: b", "data: [DONE]"]]]);
+  const rows = diffTapes(a, b);
+  assert.equal(rows[0].status, "response");
+  const lines = rows[0].diff.join("\n");
+  assert.match(lines, /- data: a/);
+  assert.match(lines, /\+ data: b/);
+});
+
+test("formatDiff truncates long diffs", () => {
+  const ops = lineDiff(
+    Array.from({ length: 100 }, (_, i) => "old " + i),
+    Array.from({ length: 100 }, (_, i) => "new " + i)
+  );
+  const lines = formatDiff(ops, 2, 10);
+  assert.ok(lines.some((l) => l.includes("truncated")));
+});
+
+test("cli diff exits 1 on differences, 0 when identical", async () => {
+  const t = dir();
+  const { execFileSync } = await import("node:child_process");
+  const bin = new URL("../bin/cassette.js", import.meta.url).pathname;
+  const req = ["POST", "/v1/chat/completions", { model: "x" }];
+  saveTape(t, diffTape("old", [[...req, { ok: true }]]));
+  saveTape(t, diffTape("new", [[...req, { ok: false }]]));
+  const run = (args) => {
+    try {
+      return {
+        code: 0,
+        out: execFileSync(process.execPath, [bin, ...args], {
+          encoding: "utf8",
+        }),
+      };
+    } catch (e) {
+      return { code: e.status, out: String(e.stdout), err: String(e.stderr) };
+    }
+  };
+  const r1 = run(["diff", "old", "new", "--tape-dir", t]);
+  assert.equal(r1.code, 1);
+  assert.match(r1.out, /1 of 1 exchanges differ/);
+  assert.match(r1.out, /"ok": false/);
+  const r2 = run(["diff", "old", "old", "--tape-dir", t, "-q"]);
+  assert.equal(r2.code, 0);
+  assert.match(r2.out, /tapes identical/);
+  const r3 = run(["diff", "old", "missing", "--tape-dir", t]);
+  assert.equal(r3.code, 1);
+  assert.match(r3.err, /no tape named missing/);
+  rmSync(t, { recursive: true, force: true });
+});
