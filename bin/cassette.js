@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { startRecord } from "../lib/proxy.js";
 import { startReplay } from "../lib/replay.js";
 import { deleteTape, listTapes, loadTape } from "../lib/tape.js";
+import { diffTapes } from "../lib/diff.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -19,11 +20,14 @@ usage:
   cassette list [--tape-dir ./tapes]
   cassette show NAME [--tape-dir ./tapes]
   cassette rm NAME [--tape-dir ./tapes]
+  cassette diff OLD NEW [--tape-dir ./tapes] [-q]
 
 record runs a proxy on 127.0.0.1 and saves every request/response pair,
 with api keys and tokens redacted. replay serves the saved responses so
 tests run offline and deterministic. unmatched requests get a 502 unless
---passthrough forwards them upstream and records the result.
+--passthrough forwards them upstream and records the result. diff compares
+two tapes exchange by exchange, handy after re-recording one: it pairs
+requests by fingerprint and prints a unified diff of changed bodies.
 
 examples:
   cassette record --tape gpt-smoke --upstream https://api.openai.com
@@ -164,6 +168,30 @@ async function main() {
     if (!name) die("cassette rm NAME");
     if (!deleteTape(tapeDir, name)) die("no tape named " + name);
     console.log("deleted " + name);
+    return;
+  }
+
+  if (cmd === "diff") {
+    const oldName = flags._[1];
+    const newName = flags._[2];
+    if (!oldName || !newName) die("cassette diff OLD NEW");
+    const a = loadTape(tapeDir, oldName);
+    const b = loadTape(tapeDir, newName);
+    if (!a) die("no tape named " + oldName);
+    if (!b) die("no tape named " + newName);
+    const quiet = !!(flags.q || flags.quiet);
+    const rows = diffTapes(a, b);
+    const changed = rows.filter((r) => r.status !== "same").length;
+    if (!quiet) {
+      rows.forEach((r, i) => {
+        console.log(
+          "  [" + i + "] " + r.label + ": " + r.status + (r.note ? " (" + r.note + ")" : "")
+        );
+        if (r.diff) for (const l of r.diff) console.log("      " + l);
+      });
+    }
+    console.log(changed ? `${changed} of ${rows.length} exchanges differ` : "tapes identical");
+    if (changed) process.exit(1);
     return;
   }
 
