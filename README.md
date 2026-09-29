@@ -59,6 +59,25 @@ a tape is just json: name, upstream, and a list of exchanges with the
 request (method, path, redacted headers/body, fingerprint) and the response
 (status, headers, body or sse chunks). hand-editable if you need to.
 
+## diff
+
+re-recorded a tape and want to know what actually changed?
+
+```sh
+cassette diff gpt-smoke gpt-smoke-v2
+# [0] POST /v1/chat/completions -> 200: response (body differs)
+#     @@
+#     -   "content": "hello back",
+#     +   "content": "hello there",
+# [1] POST /v1/chat/completions -> 200: same
+# [2] GET /v1/models -> 200: only-in-new
+# 2 of 3 exchanges differ
+```
+
+requests are paired by fingerprint in record order, so an extra call in the
+middle doesn't shift every comparison. exits 1 when anything differs, so it
+works in ci; `-q` prints only the summary line.
+
 ## how matching works
 
 each request gets a sha256 fingerprint of method + path + canonical json
