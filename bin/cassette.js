@@ -7,6 +7,7 @@ import { startRecord } from "../lib/proxy.js";
 import { startReplay } from "../lib/replay.js";
 import { deleteTape, listTapes, loadTape } from "../lib/tape.js";
 import { diffTapes } from "../lib/diff.js";
+import { parseSize } from "../lib/sizes.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -14,7 +15,7 @@ const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const HELP = `cassette ${pkg.version} - record and replay openai-compatible api traffic
 
 usage:
-  cassette record --tape NAME --upstream URL [--port 11434] [--tape-dir ./tapes]
+  cassette record --tape NAME --upstream URL [--port 11434] [--tape-dir ./tapes] [--max-body SIZE]
   cassette replay --tape NAME [--port 11434] [--tape-dir ./tapes]
                          [--passthrough --upstream URL] [--chunk-delay MS] [--seed N] [-v]
   cassette list [--tape-dir ./tapes]
@@ -32,6 +33,8 @@ requests by fingerprint and prints a unified diff of changed bodies.
 examples:
   cassette record --tape gpt-smoke --upstream https://api.openai.com
   # point your client at http://127.0.0.1:11434, ctrl-c when done
+  cassette record --tape big --upstream https://api.openai.com --max-body 2mb
+  # bodies past the cap are stored truncated, the tape stays committable
   cassette replay --tape gpt-smoke
   OPENAI_BASE_URL=http://127.0.0.1:11434 pytest
 `;
@@ -84,11 +87,20 @@ async function main() {
     const upstream = flags.upstream;
     if (!tape) die("--tape NAME is required");
     if (!upstream) die("--upstream URL is required");
+    let maxBody;
+    if (flags["max-body"] != null) {
+      try {
+        maxBody = parseSize(flags["max-body"]);
+      } catch (err) {
+        die("--max-body: " + err.message);
+      }
+    }
     const server = await startRecord({
       tape,
       upstream,
       port,
       tapeDir,
+      maxBody,
       onExchange: (ex) =>
         console.log("recorded", ex.request.method, ex.request.path),
     });
@@ -165,7 +177,7 @@ async function main() {
 
   if (cmd === "rm") {
     const name = flags._[1];
-    if (!name) die("cassette rm NAME");
+    if (!name) die("no tape named " + name);
     if (!deleteTape(tapeDir, name)) die("no tape named " + name);
     console.log("deleted " + name);
     return;
