@@ -19,6 +19,8 @@ import {
 } from "../lib/tape.js";
 import { startRecord } from "../lib/proxy.js";
 import { startReplay } from "../lib/replay.js";
+import { buildExchange } from "../lib/exchange.js";
+import { parseSize } from "../lib/sizes.js";
 
 const dir = () => mkdtempSync(join(tmpdir(), "cassette-"));
 
@@ -600,6 +602,193 @@ test("formatDiff truncates long diffs", () => {
   assert.ok(lines.some((l) => l.includes("truncated")));
 });
 
+test("parseSize accepts bytes and kb/mb/gb", () => {  assert.equal(parseSize("512"), 512);
+  assert.equal(parseSize("512b"), 512);
+  assert.equal(parseSize("4kb"), 4096);
+  assert.equal(parseSize("4KB"), 4096);
+  assert.equal(parseSize("2mb"), 2 * 1024 * 1024);
+  assert.equal(parseSize("1.5mb"), Math.floor(1.5 * 1024 * 1024));
+  assert.equal(parseSize("1gb"), 1024 ** 3);
+  assert.throws(() => parseSize("big"), /bad size/);
+  assert.throws(() => parseSize("10tb"), /bad size/);
+});
+
+test("buildExchange leaves small bodies alone with a cap set", () => {
+  const ex = buildExchange({
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: {},
+    bodyText: '{"model":"x"}',
+    status: 200,
+    resHeaders: { "content-type": "application/json" },
+    raw: Buffer.from('{"ok":true}'),
+    started: Date.now(),
+    maxBody: 1024,
+  });
+  assert.deepEqual(ex.response.body, { ok: true });
+  assert.deepEqual(ex.request.body, { model: "x" });
+});
+
+test("buildExchange truncates oversized json bodies to a marker", () => {
+  const big = { content: "a".repeat(5000) };
+  const ex = buildExchange({
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: {},
+    bodyText: JSON.stringify(big),
+    status: 200,
+    resHeaders: { "content-type": "application/json" },
+    raw: Buffer.from(JSON.stringify(big)),
+    started: Date.now(),
+    maxBody: 1000,
+  });
+  assert.equal(ex.response.body.cassette_truncated, true);
+  assert.equal(ex.response.body.original_bytes, JSON.stringify(big).length);
+  // the fingerprint still comes from the full body, so replay matching works
+  assert.equal(
+    ex.request.fingerprint,
+    fingerprintRequest("POST", "/v1/chat/completions", JSON.stringify(big))
+  );
+});
+
+test("buildExchange truncates streamed bodies to first chunks plus a marker", () => {
+  const chunks = [
+    'data: {"delta":{"content":"hi"}}',
+    'data: {"delta":{"content":" there"}}',
+    'data: {"delta":{"content":"!"}}',
+    "data: [DONE]",
+  ];
+  const ex = buildExchange({
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: {},
+    bodyText: '{"stream":true}',
+    status: 200,
+    resHeaders: { "content-type": "text/event-stream" },
+    raw: Buffer.from(chunks.map((c) => c + "\n\n").join("")),
+    started: Date.now(),
+    maxBody: 60,
+  });
+  assert.equal(ex.response.streamed, true);
+  const body = ex.response.body;
+  assert.ok(Array.isArray(body));
+  assert.equal(body[body.length - 1], "data: [cassette-truncated]");
+  assert.ok(JSON.stringify(body).length <= 200, "chunks blew past the cap");
+  // still serializes to valid sse, marker is the last chunk
+  const sse = serializeSse(body);
+  assert.equal(parseSse(sse).at(-1), "data: [cassette-truncated]");
+});
+
+test("buildExchange truncates plain string bodies with a note", () => {
+  const text = "x".repeat(3000);
+  const ex = buildExchange({
+    method: "GET",
+    path: "/v1/models",
+    headers: {},
+    bodyText: "",
+    status: 200,
+    resHeaders: { "content-type": "text/plain" },
+    raw: Buffer.from(text),
+    started: Date.now(),
+    maxBody: 500,
+  });
+  assert.ok(typeof ex.response.body === "string");
+  // json-stringified the body is 3002 bytes (3000 chars plus the quotes)
+  assert.match(ex.response.body, /\[cassette: truncated, 3002 bytes total\]/);
+  assert.ok(ex.response.body.length < text.length);
+});
+
+test("record --max-body proxies the full body but stores it truncated", async () => {
+  const t = dir();
+  const up = fakeUpstream();
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const upPort = up.address().port;
+
+  const proxy = await startRecord({
+    tape: "capped",
+    upstream: `http://127.0.0.1:${upPort}`,
+    port: 0,
+    tapeDir: t,
+    maxBody: 40,
+  });
+  const pPort = proxy.address().port;
+  const r1 = await call(pPort, "/v1/chat/completions", {
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-1", messages: [] }),
+  });
+  assert.equal(r1.status, 200);
+  // client still sees the full upstream response while recording
+  assert.match(r1.text, /hello back/);
+  await shut(proxy);
+  await shut(up);
+
+  const saved = loadTape(t, "capped");
+  assert.equal(saved.exchanges.length, 1);
+  const ex = saved.exchanges[0];
+  assert.equal(ex.response.body.cassette_truncated, true);
+  assert.ok(ex.response.body.original_bytes > 40);
+  // the fingerprint used the full body, matching still works
+  assert.equal(
+    ex.request.fingerprint,
+    fingerprintRequest(
+      "POST",
+      "/v1/chat/completions",
+      JSON.stringify({ model: "fake-1", messages: [] })
+    )
+  );
+  rmSync(t, { recursive: true, force: true });
+});
+
+test("cli record --max-body rejects a bad size", async () => {
+  const t = dir();
+  const { execFileSync } = await import("node:child_process");
+  const bin = new URL("../bin/cassette.js", import.meta.url).pathname;
+  try {
+    execFileSync(
+      process.execPath,
+      [bin, "record", "--tape", "x", "--upstream", "http://x", "--max-body", "huge", "--tape-dir", t],
+      { encoding: "utf8" }
+    );
+    assert.fail("expected a non-zero exit");
+  } catch (e) {
+    assert.equal(e.status, 1);
+    assert.match(String(e.stderr), /--max-body: bad size/);
+  }
+  rmSync(t, { recursive: true, force: true });
+});
+
+test("replay serves a truncated json exchange without breaking", async () => {
+  const t = dir();
+  const body = JSON.stringify({ model: "x" });
+  const tape = newTape("cap", null);
+  tape.exchanges.push({
+    request: {
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: {},
+      body: { model: "x" },
+      fingerprint: fingerprintRequest("POST", "/v1/chat/completions", body),
+    },
+    response: {
+      status: 200,
+      headers: {},
+      streamed: false,
+      body: { cassette_truncated: true, original_bytes: 9000 },
+    },
+    duration_ms: 1,
+    recorded_at: new Date().toISOString(),
+  });
+  saveTape(t, tape);
+
+  const replay = await startReplay({ tape: "cap", port: 0, tapeDir: t });
+  const r = await call(replay.address().port, "/v1/chat/completions", {
+    body,
+  });
+  assert.equal(r.status, 200);
+  assert.match(r.text, /cassette_truncated/);
+  await shut(replay);
+  rmSync(t, { recursive: true, force: true });
+});
 test("cli diff exits 1 on differences, 0 when identical", async () => {
   const t = dir();
   const { execFileSync } = await import("node:child_process");
