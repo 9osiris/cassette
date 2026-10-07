@@ -27,6 +27,17 @@ every exchange lands in `./tapes/gpt-smoke.json`. authorization headers,
 api keys in query strings, and credential-looking json fields are stored as
 `[redacted]`, so tapes are safe to commit.
 
+recording a big session and the tape is getting huge? cap stored bodies:
+
+```sh
+cassette record --tape big --upstream https://api.openai.com --max-body 2mb
+```
+
+bodies past the cap are stored truncated (streamed ones keep the first
+chunks plus a marker, so replay stays valid). the client still sees the
+full response while recording, only the tape copy is cut down. sizes look
+like `512`, `64kb`, `2mb`, plain number means bytes.
+
 ## replay
 
 ```sh
